@@ -44,6 +44,13 @@ void *PLSwiftAllocObject(const void *metadata);
 uint32_t PLSwiftEnumTag(const void *value, const void *metadata);
 const char *PLSwiftEnumCaseName(const void *metadata, uint32_t tag);
 
+// How many cases the enum declares. Lets a caller walk them all rather than name one.
+uint32_t PLSwiftEnumCaseCount(const void *metadata);
+
+// Whether the case carries a payload. An empty case can be written into a value with nothing
+// more than its tag; one with a payload would need that payload built as well.
+BOOL PLSwiftEnumCaseHasPayload(const void *metadata, uint32_t tag);
+
 // The tag of the case with this name, or UINT32_MAX if the enum has no such case.
 //
 // Tags are positions in the case list and Apple reorders that list between releases:

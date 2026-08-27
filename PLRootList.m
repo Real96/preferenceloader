@@ -210,6 +210,10 @@ static const char *const kPLIdentifierCarrierCase = "connectedHeadphone";
 // instead of building the new one. One identity is enough for a section, so spending an empty
 // case costs nothing; the cases that carry a String are "NoGroup" variants with a different
 // layout.
+//
+// The preferred identity rather than a guaranteed one: while headphones are connected Settings
+// has a section of its own under this case, and the injected copy would be the duplicate.
+// PLSectionIdentityTag falls back to another unused empty case whenever it is taken.
 static const char *const kPLSectionIdentityCase = "connectedHeadphones";
 
 // Where PreferenceLoader keeps its entries, resolved at runtime rather than written down.
@@ -653,6 +657,116 @@ static void PLSetItemIdentity(PLRootContext *ctx, void *item, NSString *key) {
     PLSwiftEnumInject(identifier, tag, ctx->itemIDMeta);
 }
 
+// --- placing the section ------------------------------------------------------------------
+
+// The name of the case a section's identifier holds, or NULL when it cannot be read.
+static const char *PLSectionIdentityName(PLRootContext *ctx, const void *section) {
+    if (!section || ctx->sectionID < 0 || !ctx->sectionIDMeta) return NULL;
+    const void *identifier = (const uint8_t *)section + ctx->sectionID;
+    return PLSwiftEnumCaseName(ctx->sectionIDMeta, PLSwiftEnumTag(identifier, ctx->sectionIDMeta));
+}
+
+// Whether a section is one Settings adds for a connected accessory: the AirPods row that appears
+// at the bottom of the root list while they are paired and in range, and whatever else Apple
+// lists the same way. Matched by substring because the case is named per accessory class and
+// there is more than one of them.
+static BOOL PLIsAccessorySection(const char *caseName) {
+    return caseName != NULL &&
+           (strcasestr(caseName, "headphone") != NULL || strcasestr(caseName, "accessor") != NULL);
+}
+
+// Whether a section in this snapshot already carries `tag` as its identity.
+static BOOL PLSectionTagInUse(PLRootContext *ctx, uint32_t tag) {
+    if (tag == UINT32_MAX) return YES;
+    for (NSInteger i = 0; i < ctx->sectionCount; i++) {
+        const void *section = PLSwiftArrayElement(ctx->snapshot, i, ctx->sectionStride);
+        if (!section) continue;
+        const void *identifier = (const uint8_t *)section + ctx->sectionID;
+        if (PLSwiftEnumTag(identifier, ctx->sectionIDMeta) == tag) return YES;
+    }
+    return NO;
+}
+
+// The identity for the injected section: an empty case of the identifier enum that no section in
+// this snapshot is using.
+//
+// The preferred case first; otherwise the search runs from the last case down, since a case
+// Apple appended late is the least likely to name a section that is in the list. A case with a
+// payload is no use: it would have to be built, and the identifier is only ever read as an
+// identity here.
+//
+// Recomputed on every rebuild rather than settled once, so connecting or disconnecting an
+// accessory mid-launch simply picks whatever is free at that moment.
+static uint32_t PLSectionIdentityTag(PLRootContext *ctx) {
+    if (ctx->sectionID < 0 || !ctx->sectionIDMeta) return UINT32_MAX;
+
+    uint32_t preferred = PLSwiftEnumTagNamed(ctx->sectionIDMeta, kPLSectionIdentityCase);
+    if (preferred != UINT32_MAX && !PLSectionTagInUse(ctx, preferred)) return preferred;
+
+    for (uint32_t tag = PLSwiftEnumCaseCount(ctx->sectionIDMeta); tag-- > 0;) {
+        if (PLSwiftEnumCaseHasPayload(ctx->sectionIDMeta, tag)) continue;
+        if (PLSectionTagInUse(ctx, tag)) continue;
+        PLRootLog(@"[inject] %s is taken; falling back to %s",
+                  kPLSectionIdentityCase, PLSwiftEnumCaseName(ctx->sectionIDMeta, tag) ?: "?");
+        return tag;
+    }
+    return UINT32_MAX;
+}
+
+// Whether a row is a plain link, which is what both of the row builders start from.
+static BOOL PLItemIsLink(PLRootContext *ctx, const void *item) {
+    const void *viewType = (const uint8_t *)item + ctx->itemViewType;
+    const char *caseName = PLSwiftEnumCaseName(ctx->viewTypeMeta,
+                                               PLSwiftEnumTag(viewType, ctx->viewTypeMeta));
+    return caseName && strcmp(caseName, "link") == 0;
+}
+
+// The section the injected one is copied from, and the row inside it the rows are copied from.
+//
+// The lowest section whose first row is a plain link, rather than simply the last: while an
+// accessory is connected the last section is Settings' own accessory section, whose row is not a
+// link the row builders can rewrite. Accessory sections are skipped outright rather than by row
+// shape, so the search does not depend on how their rows look in a given release.
+static const void *PLTemplateSection(PLRootContext *ctx, const void **itemOut) {
+    for (NSInteger i = ctx->sectionCount; i-- > 0;) {
+        const void *section = PLSwiftArrayElement(ctx->snapshot, i, ctx->sectionStride);
+        if (!section) continue;
+        if (PLIsAccessorySection(PLSectionIdentityName(ctx, section))) continue;
+        // Only a section whose identifier is an empty case: overwriting the copy's identity
+        // counts on there being nothing to release, and a payload case marks a "NoGroup" section
+        // with a different layout anyway.
+        if (ctx->sectionID >= 0 && ctx->sectionIDMeta &&
+            PLSwiftEnumCaseHasPayload(ctx->sectionIDMeta,
+                                      PLSwiftEnumTag((const uint8_t *)section + ctx->sectionID,
+                                                     ctx->sectionIDMeta))) continue;
+
+        const void *items = (const uint8_t *)section + ctx->sectionItems;
+        const void *item = PLSwiftArrayElement(items, 0, ctx->itemStride);
+        if (!item || !PLItemIsLink(ctx, item)) continue;
+
+        PLRootLog(@"[inject] copying section %td as the template", i);
+        if (itemOut) *itemOut = item;
+        return section;
+    }
+    return NULL;
+}
+
+// Where the injected section goes: above the accessory sections at the foot of the list, at the
+// very end when there are none.
+//
+// Only a trailing run is stepped over, so an accessory-named section in the body of the list
+// cannot pull the tweak section up with it. The tweaks stay last of Settings' own sections, as on
+// iOS 17 and earlier, with the accessory sections underneath.
+static NSInteger PLSectionInsertIndex(PLRootContext *ctx) {
+    NSInteger index = ctx->sectionCount;
+    while (index > 0) {
+        const void *section = PLSwiftArrayElement(ctx->snapshot, index - 1, ctx->sectionStride);
+        if (!section || !PLIsAccessorySection(PLSectionIdentityName(ctx, section))) break;
+        index--;
+    }
+    return index;
+}
+
 void PLRootListInjectTweakSection(void) {
     PLRootContext ctx;
     if (!PLResolve(&ctx)) { PLRootLog(@"[inject] model not reachable"); return; }
@@ -664,8 +778,9 @@ void PLRootListInjectTweakSection(void) {
         const void *sec = PLSwiftArrayElement(ctx.snapshot, i, ctx.sectionStride);
         if (!sec) continue;
         const void *items = (const uint8_t *)sec + ctx.sectionItems;
-        PLRootLog(@"[inject]   section %td items: count %td capacity %td",
-                  i, PLSwiftArrayCount(items), PLSwiftArrayCapacity(items));
+        PLRootLog(@"[inject]   section %td (%s) items: count %td capacity %td",
+                  i, PLSectionIdentityName(&ctx, sec) ?: "?",
+                  PLSwiftArrayCount(items), PLSwiftArrayCapacity(items));
     }
 #endif
 
@@ -674,13 +789,15 @@ void PLRootListInjectTweakSection(void) {
               [titles componentsJoinedByString:@", "]);
     if (titles.count == 0) return;
 
-    // The last section serves as the template: a plain one-row link section, the shape the
-    // injected rows need. Copying it avoids constructing a Swift value from nothing.
-    const void *templateSection = PLSwiftArrayElement(ctx.snapshot, ctx.sectionCount - 1, ctx.sectionStride);
-    if (!templateSection) return;
+    // A plain link section serves as the template: the shape the injected rows need. Copying one
+    // avoids constructing a Swift value from nothing.
+    const void *templateItem = NULL;
+    const void *templateSection = PLTemplateSection(&ctx, &templateItem);
+    if (!templateSection || !templateItem) {
+        PLRootLog(@"[inject] no link section to copy");
+        return;
+    }
     const void *templateItems = (const uint8_t *)templateSection + ctx.sectionItems;
-    const void *templateItem = PLSwiftArrayElement(templateItems, 0, ctx.itemStride);
-    if (!templateItem) return;
 
     void *items = PLSwiftArrayAllocate(templateItems, (NSInteger)titles.count, ctx.itemStride, 7);
     if (!items) { PLRootLog(@"[inject] item array allocation failed"); return; }
@@ -704,8 +821,8 @@ void PLRootListInjectTweakSection(void) {
         }
     }
 
-    // Written into the array's spare capacity where there is any, into a larger buffer where
-    // there is not.
+    // Written into the array's spare capacity when the section belongs at the end and there is
+    // room, into a larger buffer otherwise.
     //
     // The root array is grown by appends and so usually carries slack, but not always: some
     // layouts arrive with capacity exactly one above the count, Apple's next rebuild fills that
@@ -718,15 +835,21 @@ void PLRootListInjectTweakSection(void) {
     NSInteger capacity = PLSwiftArrayCapacity(ctx.snapshot);
     uintptr_t storage = *(const uintptr_t *)ctx.snapshot;
 
-    if (capacity <= ctx.sectionCount) {
+    // Both read the list as Apple left it, so they are settled before the rebuild below moves
+    // any section out from under the context's count and indices.
+    NSInteger index = PLSectionInsertIndex(&ctx);
+    uint32_t sectionTag = PLSectionIdentityTag(&ctx);
+
+    if (capacity <= ctx.sectionCount || index < ctx.sectionCount) {
         void *grown = PLSwiftArrayAllocate(ctx.snapshot, ctx.sectionCount + 1, ctx.sectionStride, 7);
         if (!grown) {
             PLRootLog(@"[inject] could not grow the section array past %td", capacity);
             return;
         }
+        // Copied around the gap the new section goes into.
         uint8_t *base = (uint8_t *)grown + PLSwiftArrayElementOffset();
         for (NSInteger i = 0; i < ctx.sectionCount; i++) {
-            PLSwiftValueInitializeWithCopy(base + i * ctx.sectionStride,
+            PLSwiftValueInitializeWithCopy(base + (i < index ? i : i + 1) * ctx.sectionStride,
                                            PLSwiftArrayElement(ctx.snapshot, i, ctx.sectionStride),
                                            ctx.sectionMeta);
         }
@@ -735,12 +858,11 @@ void PLRootListInjectTweakSection(void) {
         *(void **)ctx.snapshot = grown;
         storage = (uintptr_t)grown;
         capacity = ctx.sectionCount + 1;
-        PLRootLog(@"[inject] grew the section array to %td", capacity);
+        PLRootLog(@"[inject] rebuilt the section array with %td slots", capacity);
     }
 
-    void *slot = (void *)(storage + PLSwiftArrayElementOffset() + (size_t)ctx.sectionCount * ctx.sectionStride);
+    void *slot = (void *)(storage + PLSwiftArrayElementOffset() + (size_t)index * ctx.sectionStride);
     PLSwiftValueInitializeWithCopy(slot, templateSection, ctx.sectionMeta);
-    uint32_t sectionTag = PLSwiftEnumTagNamed(ctx.sectionIDMeta, kPLSectionIdentityCase);
     if (ctx.sectionID >= 0 && sectionTag != UINT32_MAX) {
         // The template's identifier is an empty case, so it holds nothing to release.
         void *identifier = (uint8_t *)slot + ctx.sectionID;
@@ -750,6 +872,10 @@ void PLRootListInjectTweakSection(void) {
                   PLSwiftEnumCaseName(ctx.sectionIDMeta,
                                       PLSwiftEnumTag(identifier, ctx.sectionIDMeta)) ?: "?",
                   sectionTag);
+    } else {
+        // No empty case is free, so the copy keeps the template's identity and SwiftUI draws only
+        // one of the two. Injected anyway: a section that may not appear is no worse than none.
+        PLRootLog(@"[inject] no free section identity; the copy keeps the template's");
     }
     // The copy retained the template's item array; overwriting the field drops that reference
     // without releasing it, for the same reason as above.
@@ -757,8 +883,8 @@ void PLRootListInjectTweakSection(void) {
 
     // Raising the count is the last step, so the slot is complete before the list can see it.
     *(NSInteger *)(storage + kPLArrayCountOffset) = ctx.sectionCount + 1;
-    PLRootLog(@"[inject] appended section %td of %td with %lu row(s)",
-              ctx.sectionCount, capacity, (unsigned long)titles.count);
+    PLRootLog(@"[inject] section %td of %td holds %lu row(s)",
+              index, capacity, (unsigned long)titles.count);
 }
 
 // When the app last came back to the foreground. Settings rewrites its selection on the way back

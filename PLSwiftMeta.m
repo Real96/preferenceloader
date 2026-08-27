@@ -48,6 +48,7 @@ enum {
     kPLFieldDescNumFields  = 12,
     kPLFieldDescRecords    = 16,
     kPLFieldRecordSize     = 12,
+    kPLFieldRecordType     = 4,
     kPLFieldRecordName     = 8,
 };
 
@@ -148,16 +149,23 @@ static uint32_t PLSwiftStructFieldOffset(const void *metadata, uint32_t index) {
     return offsets[index];
 }
 
-// Field and case names both live in the reflection field descriptor, which stores one
-// fixed-size record per field or case; the name is the third word of the record.
-static const char *PLRecordName(const void *metadata, uint32_t index) {
+// Fields and cases both live in the reflection field descriptor, which stores one fixed-size
+// record per field or case. The record size is read rather than assumed, because a future
+// runtime may add words to it.
+static const uint8_t *PLRecord(const void *metadata, uint32_t index) {
     const void *fd = PLFieldDescriptor(metadata);
     if (!fd) return NULL;
     uint32_t count = *(const uint32_t *)((const uint8_t *)fd + kPLFieldDescNumFields);
     if (index >= count) return NULL;
     uint16_t recordSize = *(const uint16_t *)((const uint8_t *)fd + 10);
     if (recordSize == 0) recordSize = kPLFieldRecordSize;
-    const uint8_t *record = (const uint8_t *)fd + kPLFieldDescRecords + (size_t)index * recordSize;
+    return (const uint8_t *)fd + kPLFieldDescRecords + (size_t)index * recordSize;
+}
+
+// The name is the third word of the record.
+static const char *PLRecordName(const void *metadata, uint32_t index) {
+    const uint8_t *record = PLRecord(metadata, index);
+    if (!record) return NULL;
     const uint8_t *nameSlot = record + kPLFieldRecordName;
     return (const char *)PLRelative(nameSlot, *(const int32_t *)nameSlot, NO);
 }
@@ -298,10 +306,21 @@ const char *PLSwiftEnumCaseName(const void *metadata, uint32_t tag) {
     return PLRecordName(metadata, tag);
 }
 
-uint32_t PLSwiftEnumTagNamed(const void *metadata, const char *caseName) {
+uint32_t PLSwiftEnumCaseCount(const void *metadata) {
     const void *fd = PLFieldDescriptor(metadata);
-    if (!fd || !caseName) return UINT32_MAX;
-    uint32_t count = *(const uint32_t *)((const uint8_t *)fd + kPLFieldDescNumFields);
+    return fd ? *(const uint32_t *)((const uint8_t *)fd + kPLFieldDescNumFields) : 0;
+}
+
+// The second word of a case's record points at the mangled name of what the case carries, and is
+// null for a case that carries nothing.
+BOOL PLSwiftEnumCaseHasPayload(const void *metadata, uint32_t tag) {
+    const uint8_t *record = PLRecord(metadata, tag);
+    return record && *(const int32_t *)(record + kPLFieldRecordType) != 0;
+}
+
+uint32_t PLSwiftEnumTagNamed(const void *metadata, const char *caseName) {
+    if (!caseName) return UINT32_MAX;
+    uint32_t count = PLSwiftEnumCaseCount(metadata);
     for (uint32_t i = 0; i < count; i++) {
         const char *name = PLRecordName(metadata, i);
         if (name && strcmp(name, caseName) == 0) return i;
