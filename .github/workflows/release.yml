@@ -1,0 +1,298 @@
+# Builds PreferenceLoader once per packaging scheme and publishes the three .debs as a release.
+#
+# macOS is not a preference. The Makefile reads Xcode's own iphoneos SDK through `xcrun` (the copy
+# under $THEOS/sdks has a libxml2 module clash that breaks the Swift files), runs `plutil` in
+# after-stage, and two of the sources are Swift, which needs Xcode's swiftc. None of that exists on
+# a Linux runner.
+#
+# One theos, and it is the roothide fork, for all three schemes. prefs.xm, Tweak.xm and PLRootList.m
+# all `#import <roothide.h>` unconditionally -- jbroot() is how a single build finds its bundles on
+# every prefix, roothide's own resolver under that scheme and libroot's runtime lookup under the
+# others -- so the header is needed to COMPILE rootful and rootless too, not just to link roothide.
+# Upstream theos does not ship it. The fork also still provides the rootless scheme and the
+# unprefixed rootful build, so nothing is lost by using it throughout.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag for the release, e.g. v2.3.4. This does NOT set the package version:
+          that comes from the Version: field in control. A vX.Y.Z tag must match it."
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  # The Xcode to build with. The runners keep /Applications/Xcode.app as a symlink to the default
+  # version and the versioned bundles beside it, so pin to e.g. /Applications/Xcode_16.4.app if a
+  # future default stops accepting the rootful scheme's -miphoneos-version-min=14.0.
+  XCODE_PATH: /Applications/Xcode.app
+  # The SDK the Makefile takes Preferences.tbd from. Any iPhoneOS 1x in theos/sdks will do; the
+  # Makefile picks the highest it finds. Bump the pattern, not the Makefile.
+  SDK_GLOB: '/iPhoneOS16*'
+  # Bump to throw away the cached theos tree after changing anything above.
+  TOOLCHAIN_CACHE_VERSION: v2
+
+jobs:
+  release:
+    # Any macOS runner with Xcode. Pin to a label like macos-15 if a runner image rolls forward to
+    # an Xcode that no longer builds the rootful target.
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # THEOS is exported here rather than in the job env so it can be an absolute path built from
+      # $HOME: a GitHub expression cannot expand a shell variable, and a relative path with a ".."
+      # in it is spelled one way by the cache action and another by make.
+      - name: Show the toolchain
+        run: |
+          set -euo pipefail
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          if [ -d "$XCODE_PATH" ]; then
+            sudo xcode-select -s "$XCODE_PATH"
+          else
+            echo "::warning::$XCODE_PATH is missing; using the runner's default Xcode."
+            ls -d /Applications/Xcode*.app
+          fi
+          xcodebuild -version
+          echo "iphoneos SDK: $(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "swift: $(xcrun --sdk iphoneos swiftc --version | head -1)"
+
+      # theos pseudo-signs every dylib it produces, and the signer is ldid, which the macOS
+      # runners do not carry. Without it the build dies at "Signing libprefs" with the compile and
+      # the link already done -- which is why it is installed before anything else is built rather
+      # than discovered at the end.
+      #
+      # GNU Make is deliberately left alone. The runner has 3.81 and theos prints a notice about
+      # not using every core, but this Makefile links the tweak against the libprefs it builds in
+      # the same pass (`-lprefs` out of $THEOS_OBJ_DIR) without declaring that as a prerequisite:
+      # under `-j` the tweak can reach the linker before the library exists. A few minutes of
+      # serial build is worth more than a race that fails one run in five.
+      - name: Install the build tools
+        run: |
+          set -euo pipefail
+          brew install ldid
+
+          # Checked together, so a second missing tool shows up now instead of after another push:
+          # perl runs theos' dm.pl packager, plutil the Makefile's after-stage, ar and shasum the
+          # package inspection further down.
+          missing=0
+          for tool in ldid perl plutil ar shasum xcrun; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              printf '%-8s %s\n' "$tool" "$(command -v "$tool")"
+            else
+              echo "::error::$tool not found"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+      - name: Cache theos
+        id: theos-cache
+        uses: actions/cache@v4
+        with:
+          # Must name the same directory as THEOS above; actions/cache expands a leading ~.
+          path: ~/theos
+          key: theos-roothide-${{ env.TOOLCHAIN_CACHE_VERSION }}-${{ runner.os }}
+
+      # One sparse clone of theos/sdks. The whole repository is several GB; --filter=tree:0 with a
+      # sparse checkout fetches only the SDK that is actually wanted.
+      - name: Install theos and the SDK
+        if: steps.theos-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git "$THEOS"
+
+          git clone -n --depth 1 --filter=tree:0 https://github.com/theos/sdks.git "$RUNNER_TEMP/sdks"
+          cd "$RUNNER_TEMP/sdks"
+          git sparse-checkout set --no-cone "$SDK_GLOB"
+          git checkout
+
+          shopt -s nullglob
+          sdks=( "$RUNNER_TEMP"/sdks/iPhoneOS*.sdk )
+          if [ ${#sdks[@]} -eq 0 ]; then
+            echo "::error::No SDK matches $SDK_GLOB. Pick one of:"
+            git ls-tree --name-only HEAD | grep '\.sdk$' || true
+            exit 1
+          fi
+          mkdir -p "$THEOS/sdks"
+          cp -R "${sdks[@]}" "$THEOS/sdks/"
+          echo "installed SDKs: ${sdks[*]##*/}"
+
+      # Runs on a cache hit too: a tree cached before this check existed would otherwise fail the
+      # same way the first attempt did, a hundred lines into the compile instead of here.
+      #
+      # Copied into $THEOS/include regardless of where it was found. The fork may keep it somewhere
+      # that is on the include path for a roothide build and not for a rootful one, and that
+      # difference is the whole bug this step exists to prevent.
+      - name: Make roothide.h reachable for every scheme
+        run: |
+          set -euo pipefail
+          mkdir -p "$THEOS/include" "$THEOS/lib"
+
+          if [ ! -f "$THEOS/include/roothide.h" ]; then
+            found=$(find "$THEOS" -name roothide.h -print -quit 2>/dev/null || true)
+            if [ -n "$found" ]; then
+              echo "roothide.h found at $found"
+              cp "$found" "$THEOS/include/roothide.h"
+            else
+              echo "roothide.h is not in the theos tree; taking it from roothide/libroothide."
+              git clone --depth 1 https://github.com/roothide/libroothide.git \
+                        "$RUNNER_TEMP/libroothide" || true
+              if [ -d "$RUNNER_TEMP/libroothide" ]; then
+                find "$RUNNER_TEMP/libroothide" -name 'roothide.h' \
+                     -exec cp {} "$THEOS/include/" \;
+                find "$RUNNER_TEMP/libroothide" \
+                     \( -name 'libroothide.tbd' -o -name 'libroothide.dylib' \) \
+                     -exec cp {} "$THEOS/lib/" \;
+              fi
+            fi
+          fi
+
+          if [ ! -f "$THEOS/include/roothide.h" ]; then
+            echo "::error::roothide.h not found. Put it in \$THEOS/include and libroothide in"
+            echo "::error::\$THEOS/lib. All three schemes need it, not just roothide:"
+            echo "::error::prefs.xm, Tweak.xm and PLRootList.m import it unconditionally."
+            exit 1
+          fi
+          echo "--- \$THEOS/include/roothide.h"
+          head -30 "$THEOS/include/roothide.h"
+          ls -l "$THEOS/lib"/libroothide.* 2>/dev/null || echo "(no libroothide in \$THEOS/lib)"
+
+      # The package version comes from control and from nowhere else -- theos stamps that field
+      # into every .deb, and it is the number a package manager compares to decide whether an
+      # upgrade is on offer. A tag only names a commit.
+      #
+      # So when the tag is version-shaped the two have to agree. A release tagged v2.3.4 holding
+      # packages that declare 2.3.3 is not a cosmetic mismatch: Sileo and Zebra would not offer it
+      # to anyone who already has 2.3.3. Caught here rather than after it is published.
+      - name: Read the version from control and check it against the tag
+        id: meta
+        run: |
+          set -euo pipefail
+          version=$(awk -F': *' '/^Version:/ {print $2; exit}' control | tr -d '[:space:]')
+          test -n "$version" || { echo "::error::No Version: field in control"; exit 1; }
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag='${{ inputs.tag }}'
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+
+          # Only a tag that looks like a version is held to this; one named for something else
+          # ("v-test", "vnightly") is left alone and control decides on its own. A date-shaped tag
+          # like v2026-10-03 does read as a version to this pattern and would be held to it.
+          tagged=${tag#v}
+          if printf '%s' "$tagged" \
+             | grep -Eq '^[0-9]+(\.[0-9]+)*([-~+][0-9A-Za-z.~+-]*)?$'; then
+            if [ "$tagged" != "$version" ]; then
+              echo "::error::Tag says $tagged, control says $version."
+              echo "::error::To release $tagged, set 'Version: $tagged' in control, commit it,"
+              echo "::error::and tag that commit. The version in the .deb comes from control."
+              exit 1
+            fi
+            echo "tag $tag and control $version agree."
+          else
+            echo "::notice::Tag '$tag' is not a version; using $version from control."
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # FINALPACKAGE=1 drops the DEBUG schema, and with it the file logging, the crash handlers and
+      # the navigation trace -- see the header of the Makefile. A release build should not be
+      # writing to /var/mobile/pl on someone else's device.
+      #
+      # Each scheme is built from a clean tree: THEOS_PACKAGE_SCHEME changes what gets linked, not
+      # just where it installs, and obj/ carries the previous scheme's objects.
+      - name: Build the three packages
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.meta.outputs.version }}'
+          mkdir -p out
+
+          build () {
+            scheme="$1"
+            echo "::group::$scheme"
+            # Everything .gitignore lists, rather than `make clean`: that needs the Makefile to
+            # parse first, and a half-built tree from another scheme is what breaks it.
+            rm -rf packages .theos obj _ debs
+            make package FINALPACKAGE=1 SCHEME="$scheme"
+            deb=$(ls -t packages/*.deb 2>/dev/null | head -1)
+            test -n "$deb" || { echo "::error::$scheme produced no .deb"; exit 1; }
+            cp "$deb" "out/preferenceloader_${VERSION}_${scheme}.deb"
+            echo "$scheme -> $(basename "$deb")"
+            echo "::endgroup::"
+          }
+
+          build rootful
+          build rootless
+          build roothide
+
+          # The control field each scheme stamps, as a sanity check that three different packages
+          # came out rather than the same one three times. dpkg-deb is not on a macOS runner --
+          # theos packages with its own dm.pl -- so the control file is read out of the ar archive
+          # a .deb is, letting tar work out whether the member is gzip or xz.
+          for f in out/*.deb; do
+            echo "--- $(basename "$f")"
+            if command -v dpkg-deb >/dev/null 2>&1; then
+              dpkg-deb -f "$f" Package Version Architecture
+            else
+              member=$(ar t "$f" | grep '^control\.tar' | head -1)
+              ar p "$f" "$member" | tar -xO ./control 2>/dev/null \
+                | grep -E '^(Package|Version|Architecture):' || true
+            fi
+          done
+
+          cd out && shasum -a 256 *.deb > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Upload the build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: preferenceloader-${{ steps.meta.outputs.version }}-debs
+          path: out/
+          if-no-files-found: error
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          ## PreferenceLoader $VERSION
+
+          One package per bootstrap scheme. Install the one that matches yours.
+
+          | file | scheme | install prefix |
+          |---|---|---|
+          | \`preferenceloader_${VERSION}_rootful.deb\`  | rootful  | \`/\` |
+          | \`preferenceloader_${VERSION}_rootless.deb\` | rootless | \`/var/jb\` |
+          | \`preferenceloader_${VERSION}_roothide.deb\` | roothide | randomised jbroot |
+
+          The three differ in more than where they install: without a packaging scheme the tweak
+          links \`/usr/lib/libprefs.dylib\` and CydiaSubstrate, neither of which exists on a
+          rootless bootstrap, so installing the wrong one leaves the tweak inert rather than
+          failing visibly.
+
+          Release build (\`FINALPACKAGE=1\`): no file logging, no crash handlers, no navigation
+          trace.
+
+          Checksums in \`SHA256SUMS.txt\`.
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/*.deb out/SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" out/*.deb out/SHA256SUMS.txt \
+              --title "PreferenceLoader $VERSION" --notes-file notes.md
+          fi
