@@ -7,6 +7,7 @@
 
 #import "prefs.h"
 #import "PLRootList.h"
+#import "PLSidebarList.h"
 #import "PLCrashLog.h"
 
 #define DEBUG_TAG "PreferenceLoader"
@@ -159,7 +160,7 @@ static NSInteger PSSpecifierSort(PSSpecifier *a1, PSSpecifier *a2, void *context
 /* {{{ Keeping the pushed pane on screen
    Settings pushes a container for the selected row, then decides that an identifier it does not
    know leads nowhere, clears the selection and takes the container away again. These hooks
-   substitute the pane into that push and refuse the removal that follows, while leaving a pop
+   show the pane inside that container and refuse the removal that follows, while leaving a pop
    the user asked for alone. */
 %group Navigation
 
@@ -277,59 +278,76 @@ static BOOL PLIsSwiftUIObject(id object) {
 }
 
 - (void)pushViewController:(UIViewController *)controller animated:(BOOL)animated {
-	// Substituted rather than filled afterwards: Settings builds an empty container with a
-	// placeholder title for an identifier it cannot resolve, and swapping it for the real pane
-	// here means one push with the right content and title from the first frame.
+	// Settings builds an empty container with a placeholder title for an identifier it cannot
+	// resolve. The pane is shown inside that container rather than pushed in its place: SwiftUI
+	// reconciles every later push and pop against the controllers it pushed itself, and a pane
+	// standing in for one of them is what made the pane's own subpages open twice and leave a black
+	// page behind on the way back (see PLRootListHostPane). Only where the pane cannot be a child
+	// -- it is the root of the detail column on an expanded split view -- is it still pushed in the
+	// container's place.
 	//
 	// Limited to the push that leaves the root list. The selection stays set while a pane is
-	// open, so otherwise the hook fires again when that pane pushes a page of its own and
-	// replaces it with a second copy of itself.
+	// open, so otherwise the hook fires again when that pane pushes a page of its own.
 	UIViewController *pane = (self.viewControllers.count == 1)
 		? PLRootListPaneForCurrentSelection() : nil;
-	if (pane) {
-		// UIKit raises if the same view controller is pushed twice, and an exception thrown out
-		// of here lands in the middle of SwiftUI's update, leaving the stack half-changed.
-		if ([self.viewControllers containsObject:pane]) {
-			PLRootListNote([NSString stringWithFormat:@"[nav] pane %p is already on the stack; not substituting", pane]);
-			pane = nil;
-		} else {
-			gPLPaneShownAt = CACurrentMediaTime();
-			// A preference controller reaches its navigation stack through its root controller,
-			// which in Settings is a PSRootController and therefore a navigation controller. A
-			// pane built outside that hierarchy has none, and the messages it sends looking for
-			// one arrive back at itself. Handing it the controller it is about to be pushed onto
-			// gives it what Settings would have.
-			[(PSViewController *)pane setRootController:(id)self];
-			PLRootListNote([NSString stringWithFormat:@"[nav] substituting %@ %p (stack %lu)",
-			                NSStringFromClass(pane.class), pane,
-			                (unsigned long)self.viewControllers.count]);
-		}
+	// UIKit raises if the same view controller is pushed twice, and an exception thrown out of here
+	// lands in the middle of SwiftUI's update, leaving the stack half-changed.
+	if (pane && (pane == controller || [self.viewControllers containsObject:pane])) {
+		PLRootListNote([NSString stringWithFormat:@"[nav] pane %p is already on the stack; leaving it", pane]);
+		pane = nil;
 	}
-	// Every push, not only the substituted ones: when navigation stops working, what Settings
-	// still attempts is the part that cannot be seen from the tweak's own actions.
+	BOOL host = pane && PLRootListCanHostPane(pane);
+	if (!pane) PLRootListReleaseHost(controller);
+	if (pane) {
+		gPLPaneShownAt = CACurrentMediaTime();
+		if (!host) [(PSViewController *)pane setRootController:(id)self];
+	}
+	// Every push, not only ours: when navigation stops working, what Settings still attempts is the
+	// part that cannot be seen from the tweak's own actions.
 	PLRootListNote([NSString stringWithFormat:@"[nav] push %@%@ onto [%@]",
 	                NSStringFromClass(controller.class),
-	                pane ? @" [substituted]" : @"",
+	                pane ? (host ? @" [hosting the pane]" : @" [substituted]") : @"",
 	                PLDescribeStack(self)]);
 	@try {
-		%orig(pane ?: controller, animated);
+		%orig((pane && !host) ? pane : controller, animated);
 	} @catch (NSException *exception) {
 		PLRootListNote([NSString stringWithFormat:@"[nav] push raised %@: %@",
 		                exception.name, exception.reason]);
+		return;
 	}
+	// Once the container is on the stack, so its view is loaded into the hierarchy it will be shown in.
+	if (host) PLRootListHostPane(pane, controller, self);
 }
 
 - (UIViewController *)popViewControllerAnimated:(BOOL)animated {
 	PLRootListNote([NSString stringWithFormat:@"[nav] pop (ours %d) from [%@]",
 	                PLRootListIsFilledContainer(self.topViewController),
 	                PLDescribeStack(self)]);
-	if (!PLRootListIsFilledContainer(self.topViewController)) return %orig;
+	// The flag answers for the pop it preceded and no other. Left standing after the user backs out
+	// of a page the pane opened, it would let the next housekeeping pop take the pane away too.
+	BOOL userAsked = gPLUserAskedToPop;
+	gPLUserAskedToPop = NO;
+
+	if (!PLRootListIsFilledContainer(self.topViewController)) {
+		// Going back to the pane from a page it opened makes Settings resolve the row's destination
+		// again on the way in. On iOS 18-26 that destination is a headphone page for a headphone that
+		// does not exist, and it pops itself as soon as it reappears -- which, the pane being shown
+		// inside it, takes the pane along. The refusal window is reopened for that removal, as it is
+		// on returning to the foreground.
+		NSArray<UIViewController *> *stack = self.viewControllers;
+		BOOL revealsPane = stack.count >= 2 && PLRootListIsFilledContainer(stack[stack.count - 2]);
+		UIViewController *popped = %orig;
+		if (revealsPane && popped) {
+			gPLPaneShownAt = CACurrentMediaTime();
+			PLRootListNote(@"[nav] back to the pane: reopened the refusal window");
+		}
+		return popped;
+	}
 
 	BOOL interactive = self.interactivePopGestureRecognizer.state == UIGestureRecognizerStateBegan ||
 	                   self.interactivePopGestureRecognizer.state == UIGestureRecognizerStateChanged;
 	BOOL expired = CACurrentMediaTime() - gPLPaneShownAt > kPLRefusalWindow;
-	if (gPLUserAskedToPop || interactive || expired) {
-		gPLUserAskedToPop = NO;
+	if (userAsked || interactive || expired) {
 		// The pane is not released here: that would run the tweak's own teardown, which not
 		// every tweak survives. Panes are kept for the life of the process instead.
 		return %orig;
@@ -341,6 +359,124 @@ static BOOL PLIsSwiftUIObject(id object) {
 	// few turns.
 	PLRootListHoldRootScroll();
 	return nil;
+}
+
+%end
+
+%end
+/* }}} */
+
+/* {{{ iOS 27+ root list
+   iOS 27 replaced the model again, and with it the way a row is opened: tapping one hands SwiftUI
+   the row's identifier and SwiftUI builds a destination for it, so an identifier Settings does not
+   know leads to an empty page. None of the hooks in the group above help -- nothing they can see
+   says which row was tapped. The cell's highlight does, so that is what tells the push hook to
+   show the pane.
+   See PLSidebarList.h. */
+%group SidebarList
+
+%hook UICollectionViewCell
+
+- (void)setHighlighted:(BOOL)highlighted {
+	%orig;
+	// Touch-down on a row, which is the only event that names the row the user is opening.
+	if (highlighted) PLSidebarListNoteHighlightedCell(self);
+}
+
+%end
+
+%hook UINavigationController
+
+- (void)pushViewController:(UIViewController *)controller animated:(BOOL)animated {
+	// Settings pushes an empty container for an identifier it cannot resolve. The pane is shown
+	// inside it rather than pushed in its place, so SwiftUI's record of the stack keeps matching the
+	// stack -- see PLRootListHostPane for what goes wrong otherwise.
+	//
+	// Limited to the push that leaves the root list, so a page the pane itself pushes is left
+	// alone. Unlike iOS 18-26, Settings does not then take the pane away again, so there is no
+	// removal to refuse.
+	UIViewController *pane = (self.viewControllers.count == 1)
+		? PLSidebarListPaneForTappedRow() : nil;
+	if (pane && (pane == controller || [self.viewControllers containsObject:pane])) pane = nil;
+	BOOL host = pane && PLRootListCanHostPane(pane);
+	if (!pane) PLRootListReleaseHost(controller);
+	// Where the pane cannot be a child it is still pushed in the container's place, and needs the
+	// stack handed to it before it appears.
+	if (pane && !host) [(PSViewController *)pane setRootController:(id)self];
+	@try {
+		%orig((pane && !host) ? pane : controller, animated);
+	} @catch (NSException *exception) {
+		PLRootListNote([NSString stringWithFormat:@"[nav] push raised %@: %@",
+		                exception.name, exception.reason]);
+		return;
+	}
+	if (host) PLRootListHostPane(pane, controller, self);
+}
+
+%end
+
+%end
+/* }}} */
+
+/* {{{ The hosted pane's navigation item
+   A pane is shown inside the container Settings pushed (see PLRootListHostPane), so the navigation
+   bar reads the container's item while the pane goes on writing its own -- its title, and the
+   buttons many tweaks add to their page. These keep the container's item showing the pane's, in
+   both directions: what the pane writes is copied across, and what anyone else writes into the
+   container's item -- SwiftUI resets its title to nil each time it updates the container -- is
+   answered with the pane's value instead.
+
+   The singular button setters forward to their own animated variants and the plural ones to
+   theirs, so those four, with the title, title view and prompt, are every way in. For any item that
+   is not one of a hosted pane's pair, each costs one associated-object lookup. */
+%group PaneHost
+
+%hook UINavigationItem
+
+- (void)setTitle:(NSString *)title {
+	UINavigationItem *pane = PLRootListPaneItemForHostItem(self);
+	%orig(pane ? pane.title : title);
+	PLRootListMirrorNavigationItem(self);
+}
+
+- (void)setTitleView:(UIView *)view {
+	UINavigationItem *pane = PLRootListPaneItemForHostItem(self);
+	%orig(pane ? pane.titleView : view);
+	PLRootListMirrorNavigationItem(self);
+}
+
+- (void)setPrompt:(NSString *)prompt {
+	UINavigationItem *pane = PLRootListPaneItemForHostItem(self);
+	%orig(pane ? pane.prompt : prompt);
+	PLRootListMirrorNavigationItem(self);
+}
+
+- (void)setLeftBarButtonItems:(NSArray<UIBarButtonItem *> *)items animated:(BOOL)animated {
+	UINavigationItem *pane = PLRootListPaneItemForHostItem(self);
+	%orig(pane ? pane.leftBarButtonItems : items, animated);
+	PLRootListMirrorNavigationItem(self);
+}
+
+- (void)setRightBarButtonItems:(NSArray<UIBarButtonItem *> *)items animated:(BOOL)animated {
+	UINavigationItem *pane = PLRootListPaneItemForHostItem(self);
+	%orig(pane ? pane.rightBarButtonItems : items, animated);
+	PLRootListMirrorNavigationItem(self);
+}
+
+// A single item cannot stand for the pane's whole list, so a container's item written this way is
+// given the list through the plural setter, which the hook above guards.
+- (void)setLeftBarButtonItem:(UIBarButtonItem *)item animated:(BOOL)animated {
+	UINavigationItem *pane = PLRootListPaneItemForHostItem(self);
+	if (pane) { [self setLeftBarButtonItems:pane.leftBarButtonItems animated:animated]; return; }
+	%orig;
+	PLRootListMirrorNavigationItem(self);
+}
+
+- (void)setRightBarButtonItem:(UIBarButtonItem *)item animated:(BOOL)animated {
+	UINavigationItem *pane = PLRootListPaneItemForHostItem(self);
+	if (pane) { [self setRightBarButtonItems:pane.rightBarButtonItems animated:animated]; return; }
+	%orig;
+	PLRootListMirrorNavigationItem(self);
 }
 
 %end
@@ -370,11 +506,29 @@ static BOOL PLIsSwiftUIObject(id object) {
 	// moving or renaming the scene delegate, an objc_getClass probe can.
 	PLRootListNote([NSString stringWithFormat:@"targetRootClass = %s",
 	               targetRootClass ? class_getName(targetRootClass) : "(none)"]);
+	// Either generation shows panes inside SwiftUI's container, so both need the navigation-item
+	// hooks. Initialised once, after the branch: logos rejects a group named by two %init calls
+	// even when they sit in branches that can never both run.
+	BOOL hostsPanes = NO;
 	if (objc_getClass("_TtC11SettingsApp24SettingsAppSceneDelegate")) {
 		%init(RootList);
 		%init(Navigation);
+		hostsPanes = YES;
 		PLReopenRefusalWindowOnForeground();
 		PLRootListNote(@"root list injector installed");
+	} else if (PLSidebarListAvailable()) {
+		// iOS 27 and later. Settings no longer has a scene delegate of its own to hang the install
+		// off -- the one the group above hooks is gone, which on its own is why nothing appeared --
+		// so the injector goes in on the first turn of the main runloop instead. It resolves the
+		// model on every turn and does nothing until the list exists, so installing it early costs
+		// a pair of loads per turn and nothing else.
+		%init(SidebarList);
+		hostsPanes = YES;
+		dispatch_async(dispatch_get_main_queue(), ^{ PLSidebarListInstallInjector(); });
+		PLRootListNote(@"sidebar list injector installed");
+	}
+	if (hostsPanes) {
+		%init(PaneHost);
 	}
 
 	_Firmware_lt_60 = kCFCoreFoundationVersionNumber < 793.00;

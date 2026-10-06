@@ -1,4 +1,5 @@
 #import "PLRootList.h"
+#import "PLRootListInternal.h"
 #import "PLSwiftMeta.h"
 #import "PLHeap.h"
 #import <UIKit/UIKit.h>
@@ -222,7 +223,7 @@ static const char *const kPLSectionIdentityCase = "connectedHeadphones";
 // random path under roothide, which cannot be hardcoded at all. jbroot() answers for all three --
 // it is roothide's own function under that scheme, and falls back to libroot's runtime lookup
 // otherwise, so one build is correct wherever it is installed.
-static NSString *PLPreferencesDirectory(void) {
+NSString *PLPreferencesDirectory(void) {
     return jbroot(@"/Library/PreferenceLoader/Preferences");
 }
 
@@ -233,7 +234,7 @@ static NSString *PLPreferenceBundlesDirectory(void) {
 // The directory the entry's plist was read out of. That is the Preferences directory itself for
 // an ordinary entry, and a subdirectory for a localized one -- which libprefs recognises by the
 // directory not being named Preferences, and takes strings and the icon out of.
-static NSString *PLEntrySourceDirectory(NSDictionary *record) {
+NSString *PLEntrySourceDirectory(NSDictionary *record) {
     NSString *source = record[@"source"];
     if ([source isKindOfClass:NSString.class] && source.length) return source;
     return PLPreferencesDirectory();
@@ -243,13 +244,13 @@ static NSString *PLEntrySourceDirectory(NSDictionary *record) {
 // tap and to recognise a section this tweak has already injected.
 static const char *const kPLIdentityPrefix = "PLTweak:";
 
-static NSString *PLIdentityKeyForTitle(NSString *title) {
+NSString *PLIdentityKeyForTitle(NSString *title) {
     return [@(kPLIdentityPrefix) stringByAppendingString:title];
 }
 
 // Title -> the PreferenceLoader entry it came from. The injected row carries only a string
 // identity, so this is what turns a tap back into a pane.
-static NSMutableDictionary<NSString *, NSDictionary *> *PLEntriesByTitle(void) {
+NSMutableDictionary<NSString *, NSDictionary *> *PLEntriesByTitle(void) {
     static NSMutableDictionary *entries;
     static dispatch_once_t once;
     // Owned, not autoreleased: this file is compiled without ARC, so a convenience constructor
@@ -264,7 +265,7 @@ static NSMutableDictionary<NSString *, NSDictionary *> *PLEntriesByTitle(void) {
 // the table there releases entry dictionaries a pane still being built is reading, and the
 // specifier machinery keeps a pointer to the freed memory. The set of installed tweaks does not
 // change while Settings runs, so reading it once is both correct and cheaper.
-static NSArray<NSString *> *PLTweakTitles(void) {
+NSArray<NSString *> *PLTweakTitles(void) {
     static NSArray *titles;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -305,7 +306,7 @@ static NSArray<NSString *> *PLTweakTitles(void) {
 }
 
 // The image a PreferenceLoader entry names, looked up the way PreferenceLoader looks it up.
-static UIImage *PLIconForEntry(NSDictionary *record) {
+UIImage *PLIconForEntry(NSDictionary *record) {
     NSDictionary *entry = record[@"entry"];
     if (![entry isKindOfClass:NSDictionary.class]) return nil;
     NSString *name = entry[@"icon"];
@@ -1339,8 +1340,8 @@ BOOL PLRootListIsFilledContainer(UIViewController *controller) {
 
 // The row's identifier is one Apple does not know, but it still resolves to the legacy hosting
 // path, so Settings pushes the right kind of container and simply has nothing to put in it.
-// Substituting the pane into that push keeps the transition, the back button and the title bar
-// Apple's own.
+// Showing the pane inside that container keeps the transition, the back button and the title bar
+// Apple's own (see PLRootListHostPane).
 
 static NSString *PLSelectedTweakTitle(PLRootContext *ctx);
 
@@ -1355,11 +1356,9 @@ static NSMutableDictionary<NSString *, UIViewController *> *PLPaneCache(void) {
     return panes;
 }
 
-UIViewController *PLRootListPaneForCurrentSelection(void) {
-    PLRootContext ctx;
-    if (!PLResolve(&ctx)) return nil;
-
-    NSString *title = PLSelectedTweakTitle(&ctx);
+// Shared by both generations: iOS 18-26 reaches it through the model's selection, iOS 27 through
+// the index path of the row that was tapped (see PLSidebarList.m).
+UIViewController *PLRootListPaneForTitle(NSString *title) {
     if (!title) return nil;
 
     UIViewController *pane = PLPaneCache()[title];
@@ -1379,6 +1378,130 @@ UIViewController *PLRootListPaneForCurrentSelection(void) {
         PLRootLog(@"[open] built the pane for %@", title);
     }
     return pane;
+}
+
+UIViewController *PLRootListPaneForCurrentSelection(void) {
+    PLRootContext ctx;
+    if (!PLResolve(&ctx)) return nil;
+    return PLRootListPaneForTitle(PLSelectedTweakTitle(&ctx));
+}
+
+// --- hosting a pane inside SwiftUI's controller ------------------------------------------------
+//
+// The pane used to be pushed in place of the controller SwiftUI pushes for the row. That looks
+// right for the first page, but SwiftUI keeps a record of the stack it built and reconciles every
+// later push and pop against that record, and the swapped-in pane is an entry the record does not
+// have. Choicy shows what follows: its Applications page opens normally, the first app tapped in
+// it opens the Applications page a second time, and going back eventually lands on the empty
+// controller SwiftUI built for the row -- a black page. Every PreferenceLoader pane deeper than one
+// level does the same, on iOS 18-26 and on 27 alike.
+//
+// Hosting the pane as a child of SwiftUI's controller leaves the stack exactly as SwiftUI thinks it
+// is, and the pane's own pushes are recorded like any other.
+
+// On a host's navigation item: the pane's item. On a pane's item: the host's item. Retained both
+// ways -- each item is owned by a controller that outlives the link or is the cached pane -- and
+// a pane hosted again simply has its link replaced, which releases the previous host's item.
+static const void *kPLPaneItemKey = &kPLPaneItemKey;
+static const void *kPLHostItemKey = &kPLHostItemKey;
+
+// Set while an item is being copied, so the writes the copy makes are not redirected back to the
+// pane by the hooks that guard the host's item.
+static BOOL gPLMirroringItem = NO;
+
+BOOL PLRootListCanHostPane(UIViewController *pane) {
+    return pane && ![pane.parentViewController isKindOfClass:UINavigationController.class];
+}
+
+void PLRootListMirrorNavigationItem(UINavigationItem *item) {
+    if (!item || gPLMirroringItem) return;
+    UINavigationItem *host = objc_getAssociatedObject(item, kPLHostItemKey);
+    if (!host) return;
+
+    gPLMirroringItem = YES;
+    host.title = item.title;
+    host.titleView = item.titleView;
+    host.prompt = item.prompt;
+    host.leftItemsSupplementBackButton = item.leftItemsSupplementBackButton;
+    [host setLeftBarButtonItems:item.leftBarButtonItems animated:NO];
+    [host setRightBarButtonItems:item.rightBarButtonItems animated:NO];
+    gPLMirroringItem = NO;
+}
+
+UINavigationItem *PLRootListPaneItemForHostItem(UINavigationItem *item) {
+    if (!item || gPLMirroringItem) return nil;
+    return objc_getAssociatedObject(item, kPLPaneItemKey);
+}
+
+// Whether a controller is one of the cached panes, as opposed to a container holding one.
+static BOOL PLIsPane(UIViewController *controller) {
+    return controller && objc_getAssociatedObject(controller, kPLFilledKey) == controller;
+}
+
+static void PLDetachPane(UIViewController *pane) {
+    [pane willMoveToParentViewController:nil];
+    [pane.view removeFromSuperview];
+    [pane removeFromParentViewController];
+    objc_setAssociatedObject(pane.navigationItem, kPLHostItemKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+void PLRootListReleaseHost(UIViewController *host) {
+    if (!host || PLIsPane(host) || !PLRootListIsFilledContainer(host)) return;
+    for (UIViewController *child in [[host.childViewControllers copy] autorelease]) {
+        if (PLIsPane(child)) PLDetachPane(child);
+    }
+    objc_setAssociatedObject(host, kPLFilledKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(host.navigationItem, kPLPaneItemKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (@available(iOS 15.0, *)) {
+        [host setContentScrollView:nil forEdge:NSDirectionalRectEdgeTop | NSDirectionalRectEdgeBottom];
+    }
+    PLRootLog(@"[open] %@ is being reused for another row; took the pane out", NSStringFromClass(host.class));
+}
+
+void PLRootListHostPane(UIViewController *pane, UIViewController *host, UINavigationController *navigation) {
+    if (!pane || !host || pane == host || !PLRootListCanHostPane(pane)) return;
+
+    // SwiftUI reuses its containers, so this one may still hold the pane of another tweak.
+    for (UIViewController *child in [[host.childViewControllers copy] autorelease]) {
+        if (child != pane && PLIsPane(child)) PLDetachPane(child);
+    }
+
+    // A pane is cached for the life of the process, so the second time a tweak is opened it is
+    // still the child of the controller it was shown in before -- unless SwiftUI reused that very
+    // controller, in which case there is nothing to move.
+    if (pane.parentViewController != host) {
+        if (pane.parentViewController) PLDetachPane(pane);
+        [host addChildViewController:pane];
+        UIView *container = host.view;
+        UIView *view = pane.view;
+        view.frame = container.bounds;
+        view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [container addSubview:view];
+        [pane didMoveToParentViewController:host];
+    }
+
+    // A preference controller reaches its navigation stack through its root controller, which in
+    // Settings is a PSRootController and therefore a navigation controller. A pane built outside
+    // that hierarchy has none; handing it the stack it is shown on gives it what Settings would.
+    [(PSViewController *)pane setRootController:(id)navigation];
+
+    // The pop refusal and the detail-column code look for the marker on the controller that is on
+    // the stack, which is now the host.
+    objc_setAssociatedObject(host, kPLFilledKey, pane, OBJC_ASSOCIATION_ASSIGN);
+
+    UINavigationItem *hostItem = host.navigationItem;
+    UINavigationItem *paneItem = pane.navigationItem;
+    objc_setAssociatedObject(hostItem, kPLPaneItemKey, paneItem, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(paneItem, kPLHostItemKey, hostItem, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    PLRootListMirrorNavigationItem(paneItem);
+
+    // The bar's scroll-edge appearance follows the top controller's content scroll view, which
+    // would otherwise be the host's own empty one rather than the pane's list.
+    if (@available(iOS 15.0, *)) {
+        UIScrollView *scroll = (UIScrollView *)PLFirstScrollView(pane.view, 0);
+        if (scroll) [host setContentScrollView:scroll forEdge:NSDirectionalRectEdgeTop | NSDirectionalRectEdgeBottom];
+    }
+    PLRootLog(@"[open] hosted %@ inside %@", NSStringFromClass(pane.class), NSStringFromClass(host.class));
 }
 
 // Defined below, with the rest of the selection reading.
